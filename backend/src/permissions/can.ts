@@ -28,7 +28,7 @@ export function effectiveRole(user: AuthUser, teamId: number): Role | null {
 }
 
 // THE permission check. Every endpoint calls this, so the rules live in exactly one place.
-// "own" means the item is assigned to the user. The matrix is in CLAUDE.md (Phase 2).
+// "own" means the item is assigned to the user. The role powers are summarised in the README; tests/permissions.test.ts holds the full matrix.
 export function can(user: AuthUser, action: Action, item: ItemScope): boolean {
   const role = effectiveRole(user, item.teamId);
   if (role === null) return false;

@@ -1,168 +1,143 @@
 # Engineering decisions
 
-The choices that matter most, each with the context, the options, what I chose, and what it costs.
-Code references are to files in this repo.
+These are the choices I would explain first if you asked "why did you build it this way?"
+Each one says what the problem was, what I considered, what I picked, and what it costs.
 
 ---
 
-## 1. PostgreSQL instead of MongoDB
+## 1. PostgreSQL, not MongoDB
 
-**Context.** Work items have owners, teams, history and notifications that must agree with each other. Several
-rules depend on "check, then change" being one indivisible step (two people claiming, stale edits).
+**The problem.** A work item, its owner, its history and its notifications all have to agree with each other.
+Several rules also depend on "check, then change" happening as one step (like two people claiming the same item).
 
-**Options.**
-- MongoDB: flexible documents, easy to start.
-- PostgreSQL: relations, transactions, row locks, constraints, indexes, built-in full-text search.
+**Options.** MongoDB is easy to start with. PostgreSQL gives me transactions, row locks, constraints and
+built-in search.
 
-**Choice.** PostgreSQL with Prisma.
+**I picked PostgreSQL (with Prisma).** For example, a claim is a single statement, "set the owner, but only if
+nobody owns it yet", and the database decides who wins. One transaction can also save the item, its history,
+a background job and an idempotency key together. Search needs no extra service.
 
-**Why.**
-- The claim is one statement, `UPDATE ... WHERE assignee_id IS NULL`, and the database decides the winner.
-- One transaction can write the item, its history row, an outbox job and an idempotency key together.
-- Unique constraints are the last line of defence (`notifications.job_id`, `idempotency_keys(user_id, key)`).
-- Full-text search needs no extra system (a GIN index in the first migration).
-
-**Trade-off.** Schema changes need migrations, and I used raw SQL for two things Prisma cannot express: the list
-query with search (`items/queries.ts`) and the job-taking query with `FOR UPDATE SKIP LOCKED`
-(`outbox/processor.ts`). Raw SQL is parameterised, but it is outside Prisma's type checking.
+**The cost.** Changing the tables means writing migrations. And in two places I wrote raw SQL because Prisma
+can't express it (the search list, and the worker picking jobs). It's parameterised, but Prisma isn't checking its types.
 
 ---
 
-## 2. A version number for stale edits, instead of locking items
+## 2. A version number for stale edits, instead of locking
 
-**Context.** Two people can open the same item. The second to save must not silently overwrite the first.
+**The problem.** Two people open the same item. The second one to save must not quietly erase the first one's change.
 
-**Options.**
-- Lock the item while someone edits: simple to explain, but locks get stuck when a tab is closed, and the app
-  needs timeouts and "break the lock" logic.
-- Last write wins: no blocking, but data is lost without anyone noticing.
-- Version number (optimistic locking): no locks, conflicts are detected.
+**Options.** Lock the item while someone edits (locks get stuck when a tab is closed). Let the last save win
+(changes get lost silently). Or use a version number.
 
-**Choice.** Every item has `version`, starting at 1 and going up by 1 on every change. Edit, assign and status
-change must send the `version` they saw. The update is `UPDATE ... WHERE id = ? AND version = ?`. If no row
-matches, the server answers `409` with the latest item. There is no automatic merge.
+**I picked the version number.** Every item has a `version` that goes up by 1 on every change. Editing, assigning
+and changing status all send the version the user saw. The database only updates the row if that version is
+still the current one. If not, the server answers `409` with the latest item. There is no automatic merging.
 
-**Why two checks.** The code first compares versions (a cheap early answer), and the `WHERE version = ?` in the
-update is the real guard against two requests that both read before either writes. `tests/race.test.ts` forces
-exactly that interleaving; with the `WHERE` condition removed, 4 of its 5 tests fail.
+I check the version twice. The first check is an early, cheap answer. The second one, inside the update itself,
+is the one that really protects us when two requests arrive at the same moment. I wrote a test that forces
+that exact situation, and it fails if I remove the second check.
 
-**Frontend detail.** The edit form remembers the version it *started from*. The page refreshes in the
-background, so using the version on screen would quietly overwrite someone else's change. The user chooses
-"use the latest values" or "keep my edits".
+The edit form also remembers the version it *started* from. The page refreshes in the background, so without
+this, saving would send the newer version and overwrite someone else's change without any warning.
 
-**Trade-off.** Users sometimes see "someone else changed this item" and must retry. For claim, there is no
-version: the conflict is "already owned", which is checked by the update's own condition.
+**The cost.** People sometimes see "someone else changed this" and have to retry. That's the price of not locking.
 
 ---
 
-## 3. Roles per team, enforced by one `can()` function
+## 3. Roles per team, checked in one place
 
-**Context.** People work in several teams with different powers (Viewer, Member, Lead), plus a global Admin.
-Permissions checked in many places drift apart; permissions checked only in the browser are no permissions.
+**The problem.** One person can be a Lead in Payments and only a Viewer in Operations. If permission checks are
+scattered around, they drift apart. If they're only in the browser, they aren't real.
 
-**Options.**
-- Roles on the user: simple, but cannot say "Lead in Payments, Viewer in Operations".
-- Custom permission sets per user: flexible, but heavy to build and to reason about.
-- Fixed roles per team and one function.
+**Options.** One role per user (too simple). Custom permissions per user (too heavy). Fixed roles per team.
 
-**Choice.** `memberships(user, team, role)` and `can(user, action, item)` in `permissions/can.ts`, called by every
-endpoint. The role is read from the database on every request, so a change takes effect at once.
-Admin counts as Lead in every team. Nobody can approve their own item, not even an Admin.
+**I picked fixed roles per team and a single `can(user, action, item)` function.** Every endpoint calls it.
+The roles are read from the database on every request, so a change applies immediately. An Admin counts as a
+Lead in every team. Nobody can approve their own item, not even an Admin.
 
-**Hidden, not forbidden.** Items from other teams return `404`, the same answer as for an item that does not
-exist, so nobody can learn which items exist. `403` is only used when you can see the item but may not do the
-thing. Lists and counts are filtered with the same rules (`items/filters.ts`).
+Items from other teams return `404`, the same as an item that doesn't exist, so nobody can find out what exists.
+`403` is only for "you can see it, but you can't do that".
 
-**The `actions` and `transitions` in an item response** tell the UI what to show, computed with the same
-`can()`. The server still re-checks every request.
-
-**Trade-off.** Fixed roles are less flexible than custom permissions. Reading the user's roles on every request
-costs one small query.
+**The cost.** Fixed roles are less flexible than custom permissions, and there's one small extra query per request.
 
 ---
 
-## 4. History is written in the same transaction as the change
+## 4. History is saved in the same transaction as the change
 
-**Context.** The history must never disagree with the item: no change without a history row, no history row for
-a change that did not happen.
+**The problem.** The history must never disagree with the item. No change without a history row, and no history
+row for a change that didn't happen.
 
-**Options.** Write history afterwards (can be lost if the process dies in between), use a database trigger
-(hidden from the code, harder to attach "who"), or write it in the same transaction.
+**Options.** Write the history afterwards (lost if the server dies in between), use a database trigger (hidden,
+and it doesn't know who did it), or write it in the same transaction.
 
-**Choice.** Every mutation runs in `prisma.$transaction` and calls `logActivity(tx, ...)` with the same `tx`
-(`items/activity.ts`). `activity_events` is add-only; nothing updates or deletes it.
-`tests/claim.test.ts` makes the history insert fail on purpose and checks that the claim is undone.
+**I picked the same transaction.** If anything fails, the change and its history are undone together. I tested
+this by making the history insert fail on purpose and checking that the claim was rolled back. History rows are
+only ever added, never edited or deleted.
 
-**Trade-off.** The table only grows. It has an index on `(item_id, created_at)` and is read with cursor paging.
-At large scale it would be partitioned or archived.
-
----
-
-## 5. Main actions are synchronous; notifications go through a Postgres outbox
-
-**Context.** Notifying people is secondary. A failing notification must not fail or slow the main action, but a
-committed change must never lose its notification.
-
-**Options.** Send inside the request (slow, and fails the action), push to a queue like SQS after the commit
-(the commit can succeed and the push fail, so a notification is lost), or write a job row in the same
-transaction and let a worker handle it.
-
-**Choice.** The transaction that changes an item also inserts rows into `outbox_jobs`. A separate worker takes jobs
-with `FOR UPDATE SKIP LOCKED` (so two workers never take the same job) and a lease (so a job taken by a worker
-that then crashes reappears after 30 seconds). Failures retry with waits of 2s, 4s, 8s, 16s and the job becomes
-`FAILED` after 5 attempts. A job that keeps crashing its worker is also given up on.
-
-**Safe to run twice.** Delivery is at-least-once, so the handler must be idempotent: `notifications.job_id` is
-unique, a second insert is refused by the database, and the handler treats that as "already done".
-One job means one recipient means one notification.
-
-**Idempotency keys** for create item and add comment use the same idea: the key is saved in the same transaction
-as the work, so either both exist or neither does. Two identical requests at the same moment are settled by the
-primary key; the loser's work is rolled back and it returns the winner's response. Keys older than 24 hours are
-ignored and deleted by the worker.
-
-**Trade-off.** Notifications can arrive a few seconds late, and a job can run more than once. Both are handled
-by design rather than hidden. At 10x scale this table becomes SQS.
+**The cost.** The table only grows. It has an index and is read page by page. At a much larger scale I'd split or
+archive it.
 
 ---
 
-## 6. Things I chose not to build (and why)
+## 5. Notifications go through an outbox, not straight from the request
 
-- **Websockets.** The page refetches on tab focus and every 30 seconds. Simple and robust; costs up to 30 s of delay.
-- **Email, attachments, SSO, sign-up and user admin screens, comment editing, custom roles.** Not needed to show
-  the core behaviours, and each adds surface area to test.
-- **Offset pagination.** Cursor paging on `(updated_at, id)` stays fast on big tables and does not repeat or skip
-  rows when data changes between pages (`tests/list.test.ts` checks this).
-- **A compiled production build.** The containers run TypeScript through `tsx`. Fewer moving parts for the reviewer;
-  slower startup and a larger image.
+**The problem.** Notifying people is secondary. A broken notification must not break the main action, but once a
+change is saved, its notification must not get lost.
+
+**Options.** Send it during the request (slow, and it can fail the action). Push to a queue after saving (the save
+can succeed and the push fail, so the notification is lost). Or save a "job" row in the same transaction and let a
+separate worker handle it.
+
+**I picked the job table and a worker.** The job is saved together with the change, so they stand or fall together.
+The worker takes jobs so that two workers never get the same one. If a worker crashes mid-job, the job comes back
+after 30 seconds. A failing job is retried with longer and longer waits (2s, 4s, 8s, 16s) and is marked `FAILED`
+after 5 tries.
+
+Because a job can run twice, the handler is safe to repeat: the notifications table has a unique `job_id`, so a
+second insert is refused and treated as "already done".
+
+I used the same idea for the duplicate-request key on "create item" and "add comment". The key is saved in the same
+transaction as the work, so both exist or neither does. If two identical requests arrive together, the database
+lets one win and the other returns the winner's answer. Keys older than 24 hours are ignored and cleaned up.
+
+**The cost.** A notification can arrive a few seconds late, and a job can run more than once (handled, as above).
+At a much bigger scale this table would become a real queue like SQS.
 
 ---
 
-## What happens when things fail
+## What I chose not to build
 
-| Situation | What happens |
+- **Websockets.** The page refreshes when you come back to the tab and every 30 seconds. Simpler, but up to 30 seconds behind.
+- **Email, file uploads, SSO, sign-up and user screens, editing comments, custom roles.** Not needed to show the
+  core behaviour, and each one adds more to test.
+- **Page numbers.** I used cursor paging, which stays fast on big tables and doesn't repeat or skip rows when
+  data changes between pages.
+- **A compiled production build.** The containers run the TypeScript with `tsx`. Fewer moving parts, slower start.
+
+## When things go wrong
+
+| What happens | What the system does |
 |---|---|
-| Two users claim the same item | The database lets one `UPDATE` match. The other gets `409 ALREADY_CLAIMED` naming the owner. The UI rolls back its optimistic update and shows the reason |
-| Someone saves an outdated copy | `409 VERSION_CONFLICT` with the latest item; nothing is changed; the UI shows the latest version |
-| Browser retries or double click | Same `Idempotency-Key`: one item or comment, same response with `Idempotent-Replayed: true` |
-| The API dies halfway through a request | The transaction rolls back: no half change, no orphan history row or job |
-| The database is down | `/health` returns 503, requests return a generic 500 (details only in the server log), the worker logs and retries |
-| The worker crashes during a job | The lease runs out, another run takes the job; the handler is safe to repeat |
-| A job keeps failing | Retried with growing waits, then `FAILED` with `last_error` kept for inspection |
-| Someone asks for an item in another team | `404`, identical to a missing item |
-| Token expired or tampered | `401`; the app sends the user back to the login page |
+| Two people claim the same item | One wins. The other gets `409` naming the owner, and the screen rolls back and shows why |
+| Someone saves an old copy | `409` with the latest item. Nothing changes |
+| Double click or browser retry | Same key, so one item or comment and the same answer back |
+| The server dies mid-request | The transaction rolls back. No half-done change |
+| The database is down | `/health` reports it, users get a plain error, details stay in the server log |
+| The worker crashes mid-job | The job comes back after the lease ends and is safely repeated |
+| A job keeps failing | Retried with longer waits, then `FAILED` with the error saved |
+| Someone asks for another team's item | `404`, same as a missing one |
+| Token expired or fake | `401`, and the app goes back to the login page |
 
-## What I would confirm with a product manager first
+## What I would check with a product manager first
 
-- Should approval notifications also reach Admins, and what if a team has only one Lead?
-- Can a Lead approve an item they created (as opposed to one assigned to them)?
-- Should comments change the item's "last updated" time and the version?
-- Should a Viewer be able to comment? (I assumed yes.)
-- Should closed items ever be reopened by an Admin? (I assumed no: Closed is final.)
-- What should happen to open items when someone leaves a team?
+- Should Admins also be told when approval is needed? What if a team has only one Lead?
+- Can a Lead approve an item they created, as opposed to one assigned to them?
+- Should a comment change the item's "last updated" time?
+- Can a Viewer comment? (I assumed yes.)
+- Can an Admin ever reopen a Closed item? (I assumed no.)
+- What should happen to someone's open items when they leave a team?
 
 ## Next week
 
-Mark-all-read and notification paging, an integration test that drives the UI (Playwright), email delivery
-through the same outbox, a compiled production image, per-key request hashing for idempotency,
-and a read replica for the dashboard counts.
+Mark-all-read for notifications, UI tests with Playwright, email through the same outbox, a compiled production
+image, and checking that a reused idempotency key has the same request body.

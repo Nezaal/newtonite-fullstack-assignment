@@ -1,0 +1,6 @@
+# Shell scripts and Docker files must keep Unix line endings, or they fail inside Linux containers.
+* text=auto
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.conf text eol=lf
+*.yml text eol=lf

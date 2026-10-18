@@ -1,0 +1,193 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  VIEWER
+  MEMBER
+  LEAD
+}
+
+enum ItemType {
+  INCIDENT
+  CUSTOMER_ISSUE
+  PAYMENT
+  COMPLIANCE
+  TASK
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum Status {
+  OPEN
+  IN_PROGRESS
+  AWAITING_APPROVAL
+  RESOLVED
+  CLOSED
+}
+
+enum JobStatus {
+  PENDING
+  DONE
+  FAILED
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  isAdmin      Boolean  @default(false) @map("is_admin")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  memberships   Membership[]
+  assignedItems WorkItem[]       @relation("ItemAssignee")
+  createdItems  WorkItem[]       @relation("ItemCreator")
+  comments      Comment[]
+  activity      ActivityEvent[]
+  idempotency   IdempotencyKey[]
+  notifications Notification[]
+
+  @@map("users")
+}
+
+model Team {
+  id   Int    @id @default(autoincrement())
+  name String @unique
+
+  memberships Membership[]
+  items       WorkItem[]
+
+  @@map("teams")
+}
+
+model Membership {
+  userId Int  @map("user_id")
+  teamId Int  @map("team_id")
+  role   Role
+
+  user User @relation(fields: [userId], references: [id])
+  team Team @relation(fields: [teamId], references: [id])
+
+  @@id([userId, teamId])
+  @@map("memberships")
+}
+
+model WorkItem {
+  id          Int       @id @default(autoincrement())
+  teamId      Int       @map("team_id")
+  title       String
+  description String    @default("")
+  type        ItemType
+  priority    Priority  @default(MEDIUM)
+  status      Status    @default(OPEN)
+  assigneeId  Int?      @map("assignee_id")
+  createdById Int       @map("created_by")
+  dueDate     DateTime? @map("due_date")
+  version     Int       @default(1)
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  team      Team  @relation(fields: [teamId], references: [id])
+  assignee  User? @relation("ItemAssignee", fields: [assigneeId], references: [id])
+  createdBy User  @relation("ItemCreator", fields: [createdById], references: [id])
+
+  comments      Comment[]
+  activity      ActivityEvent[]
+  notifications Notification[]
+
+  @@index([teamId, status])
+  @@index([assigneeId, status])
+  @@index([teamId, updatedAt, id])
+  @@map("work_items")
+}
+
+model Comment {
+  id        Int      @id @default(autoincrement())
+  itemId    Int      @map("item_id")
+  userId    Int      @map("user_id")
+  body      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  item WorkItem @relation(fields: [itemId], references: [id])
+  user User     @relation(fields: [userId], references: [id])
+
+  @@index([itemId, createdAt])
+  @@map("comments")
+}
+
+// Add-only: the app never updates or deletes rows here.
+model ActivityEvent {
+  id        Int      @id @default(autoincrement())
+  itemId    Int      @map("item_id")
+  userId    Int      @map("user_id")
+  action    String
+  oldValue  String?  @map("old_value")
+  newValue  String?  @map("new_value")
+  note      String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  item WorkItem @relation(fields: [itemId], references: [id])
+  user User     @relation(fields: [userId], references: [id])
+
+  @@index([itemId, createdAt])
+  @@map("activity_events")
+}
+
+model IdempotencyKey {
+  userId    Int      @map("user_id")
+  key       String
+  response  Json
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@id([userId, key])
+  @@index([createdAt])
+  @@map("idempotency_keys")
+}
+
+model OutboxJob {
+  id        Int       @id @default(autoincrement())
+  type      String
+  payload   Json
+  status    JobStatus @default(PENDING)
+  attempts  Int       @default(0)
+  lastError String?   @map("last_error")
+  runAfter  DateTime  @default(now()) @map("run_after")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  notification Notification?
+
+  @@index([status, runAfter])
+  @@map("outbox_jobs")
+}
+
+model Notification {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @map("user_id")
+  itemId    Int      @map("item_id")
+  jobId     Int      @unique @map("job_id")
+  message   String
+  isRead    Boolean  @default(false) @map("is_read")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User      @relation(fields: [userId], references: [id])
+  item WorkItem  @relation(fields: [itemId], references: [id])
+  job  OutboxJob @relation(fields: [jobId], references: [id])
+
+  @@index([userId, isRead, createdAt])
+  @@map("notifications")
+}

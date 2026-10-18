@@ -65,6 +65,11 @@ async function createItems(adminId: number, teams: Map<string, TeamPeople>): Pro
 }
 
 async function main(): Promise<void> {
+  // Used by docker compose: seed the first time only, never wipe data that people have created.
+  if (process.argv.includes("--if-empty") && (await prisma.user.count()) > 0) {
+    console.log("Database already has data, skipping seed.");
+    return;
+  }
   await clearTables();
   const { adminId, teams } = await createPeople();
   await createItems(adminId, teams);
